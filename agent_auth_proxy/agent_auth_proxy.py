@@ -1,7 +1,7 @@
 import asyncio
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
-from agent_auth_proxy.cancel_wait_redirect import addons
+from cancel_wait_redirect import addons
 
 async def main():
     # Configure mitmproxy options. For instance:

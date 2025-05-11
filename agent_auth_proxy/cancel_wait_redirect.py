@@ -1,7 +1,19 @@
+import base64
+import json
+from urllib.parse import urljoin, urlparse
+
+import requests
+
 from mitmproxy import http, ctx
 import uuid
 
 pending_requests = {}
+
+HOP_BY_HOP = {
+    "connection","keep-alive","proxy-authorization",
+    "proxy-authenticate","te","trailer",
+    "transfer-encoding","upgrade"
+}
 
 class CancelWaitRedirectAddon:
 
@@ -14,10 +26,22 @@ class CancelWaitRedirectAddon:
             request_id = str(uuid.uuid4())
             ref = flow.request.headers.get("Referer", "")
 
+            clean_headers = {
+                k: v for k, v in flow.request.headers.items()
+                if k.lower() not in HOP_BY_HOP
+            }
             pending_requests[request_id] = {
                 "status": "pending",
-                "ref": ref
+                "ref": ref,
+                "req": {
+                    "method": flow.request.method,
+                    "url": flow.request.url,
+                    "headers": dict(clean_headers),
+                    "body": base64.b64encode(flow.request.get_content()).decode("ascii")
+
+                }
             }
+
             print(f"[REQUEST] Generated req_id={request_id}")
 
             # Tell the client to redirect to /waiting_page?req_id=XYZ
@@ -41,7 +65,10 @@ class CancelWaitRedirectAddon:
                 self.handle_approve(flow)
             elif path.startswith("/reject"):
                 self.handle_reject(flow)
+            elif path.startswith("/replay_request"):
+                self.handle_replay_request(flow)
             else:
+                print(f"[REQUEST_HEADERS] no handler for {path!r}, sending 404")
                 flow.response = http.Response.make(404, b"Not Found")
 
     def serve_waiting_page(self, flow: http.HTTPFlow):
@@ -65,8 +92,6 @@ class CancelWaitRedirectAddon:
             )
             return
 
-        ref = pending_requests[req_id].get("ref", "")
-
         waiting_html = f"""
         <html>
         <head><title>Request Pending Approval</title></head>
@@ -80,11 +105,7 @@ class CancelWaitRedirectAddon:
                 let resp = await fetch("http://fakehost.mitm/check_approval?req_id=" + reqId);
                 let data = await resp.json();
                 if (data.status === "approved") {{
-                    if ("{ref}" && "{ref}".length > 0) {{
-                        window.location = "{ref}";
-                    }} else {{
-                        window.history.back();
-                    }}
+                    window.location.href = `/replay_request?req_id={req_id}`;
                 }} else if (data.status === "rejected") {{
                     document.body.innerHTML = "<h1>Request was rejected.</h1>";
                 }}
@@ -115,9 +136,10 @@ class CancelWaitRedirectAddon:
             return
 
         resp_data = {"status": entry["status"]}
+        body = json.dumps(resp_data).encode("utf-8")
         flow.response = http.Response.make(
             200,
-            bytes(str(resp_data), "utf-8"),
+            body,
             {"Content-Type": "application/json"}
         )
 
@@ -140,5 +162,75 @@ class CancelWaitRedirectAddon:
             )
         else:
             flow.response = http.Response.make(404, b"Invalid request_id")
+
+    def handle_replay_request(self, flow: http.HTTPFlow):
+        try:
+            rid = flow.request.query.get("req_id", "")  # plain string
+            entry = pending_requests.pop(rid, None)
+            if not entry or entry["status"] != "approved":
+                flow.response = http.Response.make(
+                    400, b"Not approved", {b"Content-Type": b"text/plain"}
+                )
+                return
+
+            orig = entry["req"]
+            real_host = urlparse(orig["url"]).hostname
+
+            resp = requests.request(
+                method=orig["method"],
+                url=orig["url"],
+                headers={k: v for k, v in orig["headers"].items()
+                         if k.lower() not in HOP_BY_HOP},
+                data=base64.b64decode(orig["body"]),
+                allow_redirects=False
+            )
+
+            # Build headers to send back
+            response_headers = []
+
+            # 1) Copy non-hop-by-hop, non-Set-Cookie headers
+            for k, v in resp.headers.items():
+                lk = k.lower()
+                if lk in HOP_BY_HOP or lk == "set-cookie":
+                    continue
+                if lk == "location":
+                    v = urljoin(orig["url"], v)
+                response_headers.append((k.encode(), v.encode()))
+
+            # 2) Rewrite & forward all Set-Cookie headers
+            raw = getattr(resp.raw, "_original_response", None)
+            raw_cookies = raw.msg.get_all("Set-Cookie") if raw else []
+            for cookie in raw_cookies or []:
+                parts = [p.strip() for p in cookie.split(";")]
+                new_parts = []
+                for p in parts:
+                    lp = p.lower()
+                    if lp.startswith("domain="):
+                        # force domain to the real host
+                        new_parts.append(f"Domain={real_host}")
+                    elif lp == "secure":
+                        # drop Secure so it can be set over HTTP proxy
+                        continue
+                    else:
+                        new_parts.append(p)
+                new_cookie = "; ".join(new_parts)
+                response_headers.append((b"Set-Cookie", new_cookie.encode()))
+
+            # 3) Body: empty for redirects, else actual content
+            body = b"" if 300 <= resp.status_code < 400 else resp.content
+
+            flow.response = http.Response.make(
+                resp.status_code,
+                body,
+                response_headers
+            )
+
+        except Exception as e:
+            ctx.log.error(f"[REPLAY_REQ ERROR] {e!r}")
+            flow.response = http.Response.make(
+                502,
+                f"Proxy replay error: {e}".encode(),
+                {b"Content-Type": b"text/plain"}
+            )
 
 addons = [CancelWaitRedirectAddon()]
