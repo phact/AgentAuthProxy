@@ -1,8 +1,12 @@
 import base64
 import json
-from urllib.parse import urljoin, urlparse
+import threading
+import traceback
+import urllib.parse
+from urllib.parse import urljoin, urlparse, urlencode
 
 import requests
+import sseclient
 
 from mitmproxy import http, ctx
 import uuid
@@ -16,6 +20,9 @@ HOP_BY_HOP = {
 }
 
 class CancelWaitRedirectAddon:
+    def __init__(self, notify_url, token):
+        self.notify_url = notify_url
+        self.token = token
 
     def load(self, loader):
         print("[STARTUP] Proxy has started.")
@@ -49,6 +56,43 @@ class CancelWaitRedirectAddon:
                 b"",
                 {"Location": wait_url}
             )
+
+            def wait_for_approval(req_id):
+                details = pending_requests[req_id]
+                # pass req_id as a query so the server only sends events for it
+                requests.post(
+                    f"{self.notify_url}/api/request-approval",
+                    headers={"Authorization": f"Bearer {self.token}"},
+                    json={
+                        "req_id": req_id,
+                        "details": details,
+                    }
+                )
+                url = f"{self.notify_url}/api/stream?req_id={req_id}"
+                headers = {
+                    "Authorization": f"Bearer {self.token}",
+                    "Accept": "text/event-stream"
+                }
+                stream = requests.get(f"{url}", headers=headers, stream=True)
+                client = sseclient.SSEClient(stream)
+                try:
+                    for ev in client.events():
+                        data = json.loads(ev.data)
+                        if data["req_id"] == req_id and data["status"] in ("approved","rejected"):
+                            pending_requests[req_id]["status"] = data["status"]
+                            print(f"[APPROVAL] {data['status']} req_id={req_id}")
+                            break
+                except Exception as e:
+                    print(f"[ERROR] Error in wait_for_approval: {e}")
+                    traceback.print_exc()
+                finally:
+                    client.close()
+
+            threading.Thread(
+                target=wait_for_approval,
+                args=(request_id,),
+                daemon=True
+            ).start()
 
     def requestheaders(self, flow: http.HTTPFlow):
         host = flow.request.host
@@ -206,5 +250,3 @@ class CancelWaitRedirectAddon:
                 f"Proxy replay error: {e}".encode(),
                 {"Content-Type": "text/plain"}
             )
-
-addons = [CancelWaitRedirectAddon()]
