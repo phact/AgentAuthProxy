@@ -343,12 +343,11 @@ async def get_cards_html(request):
     return Div(*cards, id="cards", cls="space-y-6")
 
 
-#app.mount('/static', StaticFiles(directory='agentsitter/app/static'), name='static')
-app.mount('/static', StaticFiles(directory='static'), name='static')
+app.mount('/static', StaticFiles(directory='agentsitter/app/static'), name='static')
 
 def start():
     try:
-        serve(reload=False)
+        serve(appname="agentsitter.app.server" , reload=False)
     except Exception as e:
         print(f"Error: {e}")
         traceback.print_exc()
