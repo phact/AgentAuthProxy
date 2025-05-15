@@ -11,6 +11,10 @@ from monsterui.all import *
 from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+from pywebpush import webpush, WebPushException
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 
 load_dotenv()
 
@@ -19,17 +23,79 @@ GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET", "")
 
 transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")  # IPv4 only
 
+
+def _load_env_bytes(envvar: str):
+    """
+    Reads an env var which may be:
+      - a PEM (with literal "\n" escapes)
+      - a normal Base64-DER blob
+    Returns tuple (raw_bytes, was_pem:bool).
+    """
+    raw = os.getenv(envvar, "").strip()
+    if raw.startswith("-----BEGIN"):
+        # turn literal "\n" into real newlines
+        return raw.replace("\\n", "\n").encode("utf-8"), True
+    else:
+        # assume it's plain Base64 DER (may need padding)
+        # add padding if needed
+        padding = "=" * ((4 - len(raw) % 4) % 4)
+        return base64.b64decode(raw + padding), False
+
+def get_vapid_private_key_urlsafe():
+    der_or_pem, is_pem = _load_env_bytes("VAPID_PRIVATE_KEY")
+    if is_pem:
+        key = serialization.load_pem_private_key(
+            der_or_pem, password=None, backend=default_backend()
+        )
+        der = key.private_bytes(
+            serialization.Encoding.DER,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()
+        )
+    else:
+        der = der_or_pem
+    return base64.urlsafe_b64encode(der).rstrip(b"=").decode("ascii")
+
+def get_vapid_public_key_urlsafe():
+    der_or_pem, is_pem = _load_env_bytes("VAPID_PUBLIC_KEY")
+    if is_pem:
+        key = serialization.load_pem_public_key(
+            der_or_pem, backend=default_backend()
+        )
+    else:
+        key = serialization.load_der_public_key(
+            der_or_pem, backend=default_backend()
+        )
+    nums = key.public_numbers()
+    # uncompressed EC point: 0x04 || X || Y
+    raw_point = (
+            b"\x04"
+            + nums.x.to_bytes(32, "big")
+            + nums.y.to_bytes(32, "big")
+    )
+    return base64.urlsafe_b64encode(raw_point).rstrip(b"=").decode("ascii")
+
+
+key = get_vapid_public_key_urlsafe()
+with open(os.path.join(os.path.dirname(__file__), "static", "app.js"), mode="r", encoding="utf-8") as f:
+    app_js = f.read().replace("<VAPID_PUBLIC_KEY>", key)
+
+static_dir = Path(__file__).resolve().parent / "static/"
+
 app, rt = fast_app(
+    static_path=static_dir,
     hdrs=(
         Theme.slate.headers(),
         Title("AgentSitter.ai Approval Dashboard"),
         Meta(charset="utf-8"),
         Meta(name="viewport", content="width=device-width, initial-scale=1"),
-        Link(rel="manifest", href="/static/manifest.json"),
+        Link(rel="manifest", href="/manifest.json"),
         Script(src="https://unpkg.com/htmx.org@1.9.2"),
-        Script(src="/static/sw.js", type="text/javascript"),
+        Script(src="/sw.js", type="text/javascript"),
+        Script(app_js),
     )
 )
+
 app.add_middleware(SessionMiddleware, secret_key="stick-this-in-an-env-var")
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
@@ -47,9 +113,23 @@ oauth.register(
     },
 )
 
-pending = {}         # session_id -> {req_id -> asyncio.Queue}
-metadata = {}        # session_id -> {req_id -> request metadata dict}
+pending = {}  # session_id -> {req_id -> asyncio.Queue}
+metadata = {}  # session_id -> {req_id -> request metadata dict}
+subscriptions = {}  # session_id -> sub
 
+
+def send_push(sub, payload):
+    try:
+        key = get_vapid_private_key_urlsafe()
+        webpush(
+            subscription_info=sub,
+            data=json.dumps(payload),
+            vapid_private_key=key,
+            vapid_claims={"sub": "mailto:admin@example.com"},
+        )
+    except WebPushException as ex:
+        # handle expired/subscription revoked, etc.
+        print("Push failed:", ex)
 
 
 @rt('/login')
@@ -59,13 +139,15 @@ async def login(request):
     github = oauth.create_client('github')
     return await github.authorize_redirect(request, redirect_uri)
 
+
 @rt("/logout")
 async def logout(request):
     if request.session.get('user'):
-        request.session.clear()          # removes 'user', 'token', etc.
+        request.session.clear()  # removes 'user', 'token', etc.
         resp = RedirectResponse(url="/")
-        resp.delete_cookie("session")    # the cookie name you configured
+        resp.delete_cookie("session")  # the cookie name you configured
     return RedirectResponse(url="/")
+
 
 @rt('/auth')
 async def auth(request):
@@ -80,6 +162,21 @@ async def auth(request):
     request.session['user'] = user
     # Redirect back to your app (or render a page)
     return RedirectResponse(url="/")
+
+
+@rt('/api/save-subscription', methods=['POST'])
+async def save_subscription(request):
+    data = await request.json()
+    user = request.session.get('user')
+    if not user:
+        return JSONResponse({'status': 'error', 'message': 'Not authenticated'}, status_code=401)
+
+    session_id = str(user.get('id'))
+    if session_id not in subscriptions:
+        subscriptions[session_id] = {}
+
+    subscriptions[session_id] = data
+    return JSONResponse({'status': 'ok'})
 
 
 @rt('/api/request-approval', methods=['POST'])
@@ -108,7 +205,6 @@ async def request_approval(request):
             status_code=401,
         )
 
-
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
@@ -118,18 +214,33 @@ async def request_approval(request):
     user = response.json()
 
     session_id = str(user.get('id'))
-    
+
     # Initialize session dictionaries if needed
     if session_id not in pending:
         pending[session_id] = {}
     if session_id not in metadata:
         metadata[session_id] = {}
-    
+    if session_id not in subscriptions:
+        subscriptions[session_id] = {}
+        print("Warn: No subscription for user_id={session_id}")
+    else:
+        sub = subscriptions[session_id]
+        send_push(
+            sub,
+            {
+                "title": "AgentSitter.ai",
+                "body": "A new request is pending approval",
+                "url": "http://www.agentsitter.ai"
+            }
+        )
+
     q = asyncio.Queue()
     print(f"Creating queue for user_id={session_id}, req_id={req_id}: {q}")
     pending[session_id][req_id] = q
     metadata[session_id][req_id] = data
+
     return JSONResponse({'status': 'pending'})
+
 
 @rt('/api/approve', methods=['POST'])
 async def approve_request(request):
@@ -137,21 +248,21 @@ async def approve_request(request):
         # Try to get data from form
         form_data = await request.form()
         req_id = form_data.get('req_id')
-        
+
         # If not in form, try JSON
         if not req_id:
             json_data = await request.json()
             req_id = json_data.get('req_id')
-        
+
         # Get user ID from session
         user = request.session.get('user')
         if not user:
             return JSONResponse({'status': 'error', 'message': 'Not authenticated'}, status_code=401)
-        
+
         session_id = str(user.get('id'))
         if session_id not in pending:
             return JSONResponse({'status': 'error', 'message': 'No pending requests'})
-            
+
         print(f"Approve request received for user_id={session_id}, req_id={req_id}")
         q = pending[session_id].get(req_id)
         if q:
@@ -166,27 +277,28 @@ async def approve_request(request):
         print(f"Error in approve_request: {e}")
         return JSONResponse({'status': 'error', 'message': str(e)})
 
+
 @rt('/api/reject', methods=['POST'])
 async def reject_request(request):
     try:
         # Try to get data from form
         form_data = await request.form()
         req_id = form_data.get('req_id')
-        
+
         # If not in form, try JSON
         if not req_id:
             json_data = await request.json()
             req_id = json_data.get('req_id')
-        
+
         # Get user ID from session
         user = request.session.get('user')
         if not user:
             return JSONResponse({'status': 'error', 'message': 'Not authenticated'}, status_code=401)
-        
+
         session_id = str(user.get('id'))
         if session_id not in pending:
             return JSONResponse({'status': 'error', 'message': 'No pending requests'})
-            
+
         print(f"Reject request received for user_id={session_id}, req_id={req_id}")
         q = pending[session_id].get(req_id)
         if q:
@@ -201,51 +313,55 @@ async def reject_request(request):
         print(f"Error in reject_request: {e}")
         return JSONResponse({'status': 'error', 'message': str(e)})
 
+
 @rt('/api/stream', methods=['GET'])
 async def approval_stream(request):
     req_id = request.query_params.get('req_id')
     auth_header = request.headers.get('Authorization', '')
-    
+
     # Extract token from Authorization header
     token = ''
     if auth_header.startswith('Bearer '):
         token = auth_header[7:]
-    
+
     # Find the session_id that has this request
     session_id = None
     for sid in pending:
         if req_id in pending[sid]:
             session_id = sid
             break
-    
+
     if not session_id or req_id not in pending[session_id]:
         return JSONResponse({'error': 'not found'}, status_code=404)
-        
+
     q = pending[session_id][req_id]
     print(f"Stream request for req_id={req_id}, queue={q}")
-    
+
     async def event_gen():
         print(f"Waiting for data on queue for req_id={req_id}")
         data = await q.get()
         print(f"Got data from queue: {data}")
         yield f"data: {json.dumps(data)}\n\n"
+
     return StreamingResponse(event_gen(), media_type='text/event-stream')  # Server-Sent Events
+
 
 @rt('/api/pending')
 async def list_pending(request):
     user = request.session.get('user')
     if not user:
         return JSONResponse({'status': 'error', 'message': 'Not authenticated'}, status_code=401)
-    
+
     session_id = str(user.get('id'))
     if session_id not in metadata:
         return JSONResponse([])
-    
+
     return JSONResponse(list(metadata[session_id].values()))
+
 
 @rt('/')
 async def index(request):
-    user = request.session.get('user')   # None if not logged in
+    user = request.session.get('user')  # None if not logged in
     if user:
         return Title("AgentSitter.ai"), Body(
             Div(
@@ -263,16 +379,17 @@ async def index(request):
             )
         )
 
+
 # Helper function to generate cards HTML
 async def get_cards_html(request):
     user = request.session.get('user')
     if not user:
         return Div(id="cards", cls="space-y-6")
-    
+
     session_id = str(user.get('id'))
     if session_id not in metadata:
         return Div(id="cards", cls="space-y-6")
-    
+
     items = list(metadata[session_id].values())
     cards = []
 
@@ -343,14 +460,13 @@ async def get_cards_html(request):
     return Div(*cards, id="cards", cls="space-y-6")
 
 
-app.mount('/static', StaticFiles(directory='agentsitter/app/static'), name='static')
-
 def start():
     try:
-        serve(appname="agentsitter.app.server" , reload=False)
+        serve(appname="agentsitter.app.server", reload=False)
     except Exception as e:
         print(f"Error: {e}")
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     start()

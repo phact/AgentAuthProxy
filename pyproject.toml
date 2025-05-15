@@ -10,6 +10,7 @@ dependencies = [
     "mitmproxy>=11.1.0",
     "monsterui>=1.0.19",
     "python-fasthtml>=0.12.15",
+    "pywebpush>=2.0.3",
     "requests>=2.32.3",
     "sseclient-py>=1.8.0",
     "starlette>=0.46.2",
