@@ -2,8 +2,6 @@ import base64
 import json
 import threading
 import traceback
-import urllib.parse
-from urllib.parse import urljoin, urlparse, urlencode
 
 import requests
 import sseclient
@@ -66,6 +64,7 @@ class CancelWaitRedirectAddon:
                     json={
                         "req_id": req_id,
                         "details": details,
+                        "user_id": self.user_id,
                     }
                 )
                 url = f"{self.notify_url}/api/stream?req_id={req_id}"

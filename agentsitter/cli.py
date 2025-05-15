@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import time
+
+import dotenv
 import requests
 import click
 import asyncio
@@ -9,12 +11,14 @@ from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
 from agentsitter.cancel_wait_redirect import CancelWaitRedirectAddon
 
+dotenv.load_dotenv()
+
 # Configuration
 CONFIG_DIR = os.path.expanduser("~/.agentsitter")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 #NOTIFY_URL = os.getenv("AGENTSITTER_NOTIFY_URL", "https://agentsitter.ai")
 NOTIFY_URL = os.getenv("AGENTSITTER_NOTIFY_URL", "http://localhost:5001")
-GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "Iv23liRW8ExQa3akc8fz")
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")
 
 # Utility functions
 def save_config(data):
@@ -44,7 +48,7 @@ def github_device_flow():
         click.echo("Error: GITHUB_CLIENT_ID environment variable not set.")
         sys.exit(1)
 
-    # Step 1: request device code
+    # request device code
     resp = requests.post(
         "https://github.com/login/device/code",
         data={"client_id": GITHUB_CLIENT_ID, "scope": "read:user"},
@@ -59,7 +63,7 @@ def github_device_flow():
 
     click.echo(f"Open {verification_uri} and enter code: {user_code}")
 
-    # Step 2: poll for token
+    # poll for token
     token = None
     while True:
         time.sleep(interval)
