@@ -38,8 +38,8 @@ def get_token():
     config = load_config()
     token = config.get('token')
     if not token:
-        click.echo("Error: Not logged in. Run `agentsitter login` first.")
-        sys.exit(1)
+        github_device_flow()
+        return get_token()
     return token
 
 # OAuth Device Flow

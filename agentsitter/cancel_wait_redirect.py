@@ -63,8 +63,7 @@ class CancelWaitRedirectAddon:
                     headers={"Authorization": f"Bearer {self.token}"},
                     json={
                         "req_id": req_id,
-                        "details": details,
-                        "user_id": self.user_id,
+                        "details": details
                     }
                 )
                 url = f"{self.notify_url}/api/stream?req_id={req_id}"
